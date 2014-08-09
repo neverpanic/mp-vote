@@ -1,0 +1,71 @@
+#!/usr/bin/env python3.4
+# vim:ts=4:sts=4:sw=4:noet:tw=120
+
+import argparse
+import os
+import sys
+import urllib.request
+import urllib.error
+
+#################
+# CONFIGURATION #
+#################
+
+# Vote base URL (the webserver that holds the vote information and ballots)
+VOTEBASE = "https://neverpanic.de/documents/mp-vote/"
+
+# Public key file used to sign all vote XML files
+PUBKEY = "./macports-pubkey.pem"
+
+# No user-servicable parts below
+
+########
+# CODE #
+########
+
+"""
+Update the database of ballots and current votes.
+"""
+def mpvoteUpdate(args):
+	votelistURL = VOTEBASE + "list.xml"
+	votelistSignatureURL = votelistURL + ".rmd160"
+	try:
+		votelist = urllib.request.urlopen(votelistURL, cadefault=True).read()
+	except urllib.error.HTTPError as e:
+		print("Error fetching vote list: {}".format(e), file=sys.stderr)
+		return 1
+
+	try:
+		votelistSignature = urllib.request.urlopen(votelistSignatureURL, cadefault=True).read()
+	except urllib.error.HTTPError as e:
+		print("Error fetching vote list signature: {}".format(e), file=sys.stderr)
+		return 1
+
+	print(votelist)
+	print(votelistSignature)
+	return 0
+
+
+"""
+Cast a vote.
+"""
+def mpvoteCastVote(args):
+	return 1
+
+# Argument parsing and invocation
+parser = argparse.ArgumentParser(description="Cast your vote in MacPorts elections")
+parser.add_argument("-v", "--verbose", action="store_true", help="print debugging information")
+parser.add_argument("action", help="Select the mode of operation. Possible values are `update' to update the list of "
+	"ballots and `vote' to cast your vote.")
+args = parser.parse_args()
+
+actions = {
+	  'update': mpvoteUpdate
+	,   'vote': mpvoteCastVote
+}
+
+if args.action not in actions:
+	print("Unsupported action `{}'. Use --help to get usage information".format(args.action), file=sys.stderr)
+	sys.exit(1)
+
+sys.exit(actions[args.action](args))
