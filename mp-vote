@@ -6,13 +6,22 @@ import os
 import sys
 import urllib.request
 import urllib.error
+import textwrap
+
+from datetime import datetime
+
+import dateutil.parser
+import dateutil.tz
+
+from Crypto.Signature import PKCS1_v1_5
+from Crypto.Hash import RIPEMD
+from Crypto.PublicKey import RSA
+
+import xml.etree.ElementTree as ET
 
 #################
 # CONFIGURATION #
 #################
-
-# Vote base URL (the webserver that holds the vote information and ballots)
-VOTEBASE = "https://neverpanic.de/documents/mp-vote/"
 
 # Public key file used to sign all vote XML files
 PUBKEY = "./macports-pubkey.pem"
@@ -23,49 +32,326 @@ PUBKEY = "./macports-pubkey.pem"
 # CODE #
 ########
 
-"""
-Update the database of ballots and current votes.
-"""
-def mpvoteUpdate(args):
-	votelistURL = VOTEBASE + "list.xml"
-	votelistSignatureURL = votelistURL + ".rmd160"
+class SignatureVerificationError(Exception):
+	"""
+	Exception class representing a signature verification error
+	"""
+	pass
+
+class InvalidVoteDefError(Exception):
+	"""
+	Exception class representing a problem with the vote definition
+	"""
+	def __init__(self, message):
+		self.message = message
+
+	def __str__(self):
+		return "Invalid vote definition: {}".format(self.message)
+
+class InvalidXMLError(Exception):
+	"""
+	Exception class used for invalid XML documents
+	"""
+	def __init__(self, message):
+		self.message = message
+	
+	def __str__(self):
+		return "Invalid XML: {}".format(self.message)
+
+class ProgramAbortError(Exception):
+	"""
+	Exception class that wraps a critical error and encapsules it for pretty-printing of the error message.
+	"""
+	def __init__(self, message, cause):
+		self.message = message
+		self.cause = cause
+	
+	def __str__(self):
+		if self.cause is not None:
+			return "Error: {}\n       {}".format(self.message, self.cause)
+		else:
+			return "Error: {}".format(self.message)
+
+def verbose(msg, **argdict):
+	"""
+	Print a message if verbose mode is enabled
+	"""
+	if args.verbose:
+		print(msg, **argdict)
+
+def warning(msg):
+	"""
+	Print a warning message
+	"""
+	print("Warning: {}".format(msg), file=sys.stderr)
+
+def error(msg, ex):
+	"""
+	Print an error message and abort execution
+	"""
+	raise ProgramAbortError(msg, ex)
+
+def verifySignature(message, signature):
+	"""
+	Verify a RIPEMD signature made with the private key corresponding to the publiy key given in the PUBKEY file.
+	"""
+	pubkey = RSA.importKey(open(PUBKEY).read())
+	hash = RIPEMD.new(message)
+	verifier = PKCS1_v1_5.new(pubkey)
+	if not verifier.verify(hash, signature):
+		raise SignatureVerificationError()
+
+class VoteDefinition:
+	"""
+	Class that represents the details of a single vote
+	"""
+	def __init__(self, url):
+		self.url      = url
+		self.version  = None
+		self.uuid     = None
+		self.start    = None
+		self.end      = None
+		self.outerkey = None
+		self.innerkey = None
+		self.ballot   = list()
+		self.description = None
+
+	def __str__(self):
+		wrapper = textwrap.TextWrapper(width = 80)
+
+		paragraphs = list()
+		sentences = list()
+		sentences.append("This vote has a UUID of {}.".format(self.uuid))
+		sentences.append("Votes can be cast from {} until {}.".format(self.start.astimezone().strftime("%c"), self.end.astimezone().strftime("%c")))
+		sentences.append("The vote description is:")
+		paragraphs.append(wrapper.fill("\n".join(sentences)))
+
+		paragraphs.append("")
+
+		for paragraph in self.description.split("\n\n"):
+			paragraphs.append(wrapper.fill(paragraph))
+
+		paragraphs.append("")
+		paragraphs.append("The options for this vote are:")
+		for candidate in self.ballot:
+			paragraphs.append(" - {}".format(candidate))
+
+		return "\n".join(paragraphs)
+	
+	def verify(self):
+		# Check for source URL
+		if self.url is None:
+			raise InvalidVoteDefError("Missing definition URL")
+
+		# Check for vote UUID
+		if self.uuid is None:
+			raise InvalidVoteDefError("Missing vote UUID")
+
+		# Check for vote description
+		if self.description is None:
+			raise InvalidVoteDefError("Missing description")
+
+		# Check the dates
+		if self.start is None:
+			raise InvalidVoteDefError("Missing start date")
+		if self.end is None:
+			raise InvalidVoteDefError("Missing end date")
+
+		# Check the encryption keys for presence and validity
+		if self.outerkey is None:
+			raise InvalidVoteDefError("Missing outer encryption key")
+		try:
+			RSA.importKey(self.outerkey)
+		except Exception as e:
+			raise InvalidVoteDefError("Malformed outer encryption key: {}".format(e))
+		if self.innerkey is None:
+			raise InvalidVoteDefError("Missing inner encryption key")
+		try:
+			RSA.importKey(self.innerkey)
+		except Exception as e:
+			raise InvalidVoteDefError("Malformed inner encryption key: {}".format(e))
+
+		# Check the ballot size
+		if len(self.ballot) <= 1:
+			raise InvalidVoteDefError("Vote has fewer than two options")
+
+
+def downloadAndParseVoteDef(URL):
+	"""
+	Download and parse a single vote definition
+	"""
+	# Download vote definition...
 	try:
-		votelist = urllib.request.urlopen(votelistURL, cadefault=True).read()
+		verbose("Downloading vote definition from {}... ".format(URL), end="", flush=True)
+		definition = urllib.request.urlopen(URL, cadefault=True).read()
+		verbose("success.")
 	except urllib.error.HTTPError as e:
-		print("Error fetching vote list: {}".format(e), file=sys.stderr)
-		return 1
+		verbose("failed.")
+		error("Failed to fetch vote definition from {}".format(URL), e)
 
+	# ... and its signature.
+	sigURL = URL + ".rmd160"
 	try:
-		votelistSignature = urllib.request.urlopen(votelistSignatureURL, cadefault=True).read()
+		verbose("Downloading vote signature from {}... ".format(sigURL), end="", flush=True)
+		signature = urllib.request.urlopen(sigURL, cadefault=True).read()
+		verbose("success.")
 	except urllib.error.HTTPError as e:
-		print("Error fetching vote list signature: {}".format(e), file=sys.stderr)
-		return 1
+		verbose("failed.")
+		error("Failed to fetch vote definition signature from {}".format(sigURL), e)
 
-	print(votelist)
-	print(votelistSignature)
-	return 0
+	# Verify the signature. Error out if it fails to verify. Do *not* attempt to parse the XML if signature verification
+	# fails to avoid being vulnerable to XML parsing attacks such as the billion laughs or quadratic blowup. See
+	# https://docs.python.org/dev/library/xml.html#xml-vulnerabilities for details.
+	try:
+		verbose("Verifying vote definition signature... ", end="", flush=True)
+		verifySignature(definition, signature)
+		verbose("valid.")
+	except SignatureVerificationError as e:
+		verbose("invalid.")
+		error("Vote definition {} is not correctly signed.".format(URL), None)
 
+	# Start parsing the XML vote list
+	# We're using ElementTree, it seems to be the simplest
+	xmlVote = ET.fromstring(definition)
 
-"""
-Cast a vote.
-"""
-def mpvoteCastVote(args):
-	return 1
+	# Verify that the root tag's name is "vote"
+	if xmlVote.tag != "vote":
+		error("Failed to process vote definition XML", InvalidXMLError("root tag is not <vote>"))
+
+	# Check the version for compatibility
+	xmlVoteVersion = xmlVote.get("version")
+	if xmlVoteVersion is None:
+		error("Failed to process vote definition XML", InvalidXMLError("<vote> tag is missing 'version' attribute"))
+	elif xmlVoteVersion != "1":
+		error("Failed to process vote definition XML", InvalidXMLError("Unsupported value '{}' for the 'version' \
+			attribute of the <vote> tag. Try updating your voting client.".format(xmlVoteVersion)))
+
+	# Read description and UUID
+	xmlVoteUUID = xmlVote.findtext("uuid")
+	if xmlVoteUUID is None or xmlVoteUUID.strip() == "":
+		error("Failed to process vote definition XML", InvalidXMLError("<uuid> tag is missing or empty"))
+	xmlVoteDescription = xmlVote.findtext("description")
+	if xmlVoteDescription is None or xmlVoteDescription.strip() == "":
+		error("Failed to process vote definition XML", InvalidXMLError("<description> tag is missing or empty"))
+	
+	# Read and parse start and end date
+	xmlVoteStart = xmlVote.findtext("start")
+	if xmlVoteStart is None or xmlVoteStart.strip() == "":
+		error("Failed to process vote definition XML", InvalidXMLError("<start> tag is missing or empty"))
+	try:
+		xmlVoteStartDate = dateutil.parser.parse(xmlVoteStart)
+	except ValueError as e:
+		error("Failed to process vote definition XML: <start> tag:", e)
+
+	xmlVoteEnd = xmlVote.findtext("end")
+	if xmlVoteEnd is None or xmlVoteEnd.strip() == "":
+		error("Failed to process vote definition XML", InvalidXMLError("<end> tag is missing or empty"))
+	try:
+		xmlVoteEndDate = dateutil.parser.parse(xmlVoteEnd)
+	except ValueError as e:
+		error("Failed to process vote definition XML: <end> tag:", e)
+
+	# Read inner and outer public key
+	xmlVoteInnerKey = xmlVote.findtext("innerkey")
+	if xmlVoteInnerKey is None or xmlVoteInnerKey.strip() == "":
+		error("Failed to process vote definition XML", InvalidXMLError("<innerkey> tag is missing or empty"))
+	xmlVoteOuterKey = xmlVote.findtext("outerkey")
+	if xmlVoteOuterKey is None or xmlVoteOuterKey.strip() == "":
+		error("Failed to process vote definition XML", InvalidXMLError("<outerkey> tag is missing or empty"))
+
+	# Transform the XML into an internal representation of the vote definition
+	voteDef = VoteDefinition(URL)
+	voteDef.version     = xmlVoteVersion
+	voteDef.uuid        = xmlVoteUUID
+	voteDef.start       = xmlVoteStartDate
+	voteDef.end         = xmlVoteEndDate
+	voteDef.description = textwrap.dedent(xmlVoteDescription).strip()
+	voteDef.innerkey    = textwrap.dedent(xmlVoteInnerKey).strip()
+	voteDef.outerkey    = textwrap.dedent(xmlVoteOuterKey).strip()
+	voteDef.ballot      = list()
+
+	# Read candidate information and add it to the vote definition
+	xmlVoteBallot = xmlVote.find("ballot")
+	if xmlVoteBallot is None:
+		error("Failed to process vote definition XML", InvalidXMLError("<ballot> tag is missing"))
+	for xmlCandidate in xmlVoteBallot.findall("candidate"):
+		candidate = xmlCandidate.text.strip()
+		if candidate != "":
+			voteDef.ballot.append(candidate)
+
+	# Verify integrity of the vote definition; this will raise if the vote isn't sane
+	try:
+		voteDef.verify()
+	except InvalidVoteDefError as e:
+		error("Failed to process vote definition XML", e)
+
+	return voteDef
+
+def mpvotePrintInfo():
+	"""
+	Print information about a vote by URL
+	"""
+	vote = downloadAndParseVoteDef(args.url)
+	print(vote)
+
+def writeBallotFile(filename):
+	pass
+
+def mpvoteCastVote():
+	"""
+	Cast a vote given a vote definition URL
+	"""
+	vote = downloadAndParseVoteDef(args.url)
+	print(vote)
+
+	now = datetime.now(dateutil.tz.tzutc())
+	if now < vote.start:
+		error("This vote hasn't started yet. Please try again after {}.".format(vote.start.astimezone().strftime("%c")), None)
+	if now > vote.end:
+		error("This vote has ended on {}. You can no longer vote.".format(vote.end.astimezone().strftime("%c")), None)
+	
+	editor = os.getenv("EDITOR", "vim")
+	print("\n" + textwrap.fill("Pressing enter now will open the `{}' editor with the ballot and instructions on how to cast " \
+		"your vote.".format(editor), width=80))
+
+	response = ""
+	while response == "":
+		response = input("Continue? [Y/n]: ")
+		if response in ("n", "N"):
+			return 0
+		if response in ("", "y", "Y"):
+			break
+		warning("Unknown response `{}'. Please enter either `y' or `n'.".format(response))
+		response = ""
+
+	tempfile = ...
+	vote.writeBallotFile(tempfile)
+	openEditor(editor, tempfile)
+	vote.verifyBallotFile(tempfile)
 
 # Argument parsing and invocation
 parser = argparse.ArgumentParser(description="Cast your vote in MacPorts elections")
 parser.add_argument("-v", "--verbose", action="store_true", help="print debugging information")
-parser.add_argument("action", help="Select the mode of operation. Possible values are `update' to update the list of "
-	"ballots and `vote' to cast your vote.")
+parser.add_argument("action", help="Select the mode of operation. Possible values are `info' to print information"
+	" and `vote' to cast your vote.")
+parser.add_argument("url", help="The URL of the vote definition XML file.")
 args = parser.parse_args()
 
 actions = {
-	  'update': mpvoteUpdate
-	,   'vote': mpvoteCastVote
+	  'info': mpvotePrintInfo
+	, 'vote': mpvoteCastVote
 }
 
 if args.action not in actions:
 	print("Unsupported action `{}'. Use --help to get usage information".format(args.action), file=sys.stderr)
 	sys.exit(1)
 
-sys.exit(actions[args.action](args))
+try:
+	actions[args.action]()
+	sys.exit(0)
+except ProgramAbortError as e:
+	print(str(e), file=sys.stderr)
+	sys.exit(1)
+except KeyboardInterrupt as e:
+	print()
+	sys.exit(1)
